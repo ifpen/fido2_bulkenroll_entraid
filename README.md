@@ -43,9 +43,24 @@ Either:
 - The Entra account used must have the following **Graph API permissions** (delegated):
   - `UserAuthenticationMethod.ReadWrite.All`
   - `Mail.Send` (`EnrollFIDO2_fido2-cred.ps1`: sends the temporary PIN by mail)
+  - `Mail.Send.Shared` (`EnrollFIDO2_fido2-cred.ps1`: sends the mail from the configured sender address, e.g. a shared mailbox)
   - `GroupMember.Read.All` (`EnrollFIDO2_fido2-cred.ps1`: group search and group members)
   - `User.Read.All` (`EnrollFIDO2_fido2-cred.ps1`: reads `accountEnabled`)
 - `GroupMember.Read.All` and `User.Read.All` usually require **admin consent** in the tenant.
+
+### Sender address / shared mailbox (`EnrollFIDO2_fido2-cred.ps1`)
+The temporary PIN is mailed to each user (the physical key is handed over separately) from the **sender address** configured in the main window (e.g. `no-reply-mfa@example.com`):
+- The address must be an Exchange Online mailbox; a **shared mailbox** is enough (no license required).
+- The operators running the script need the **Send As** right on this mailbox. To ease staff turnover, grant it to a **mail-enabled security group** and manage its membership (Microsoft 365 groups, plain distribution lists and Entra security groups without mail are not supported):
+  ```powershell
+  Connect-ExchangeOnline
+  New-DistributionGroup -Name "SG-FIDO2-Enroleurs" -Type Security -PrimarySmtpAddress "sg-fido2-enroleurs@example.com"
+  Add-DistributionGroupMember -Identity "SG-FIDO2-Enroleurs" -Member "admin1@example.com"
+  Add-RecipientPermission -Identity "no-reply-mfa@example.com" -Trustee "SG-FIDO2-Enroleurs" -AccessRights SendAs -Confirm:$false
+  ```
+  Membership changes can take up to about one hour to apply (Exchange permission cache).
+- The delegated Graph scope `Mail.Send.Shared` is required (requested automatically at sign-in).
+- A failed mail does not stop the enrollment: it is shown in the console and recorded in the `MailSent` column of the log.
 
 ### Additional Notes
 If your Entra account is FIDO2/Passkey-protected, follow these steps:
@@ -66,6 +81,8 @@ If your Entra account is FIDO2/Passkey-protected, follow these steps:
 
 2. **Configure Tenant ID**:
    Enter your **Tenant ID** (e.g., `tenantname.onmicrosoft.com`). The tool will auto-detect the Tenant ID if available in the registry.
+
+   With `EnrollFIDO2_fido2-cred.ps1`, also enter the **sender address** (« Adresse d'expéditeur », e.g. `no-reply-mfa@example.com`). The Tenant ID and the sender address are saved in the registry (`HKCU:\Software\Token2BulkFido`, values `TenantId` and `SenderAddress`) when you click « Démarrer », and pre-filled at the next launch. Both fields are empty until configured.
 
 3. **Select the Input File**:
    Click "Select File" and choose a valid CSV file containing user UPNs. (it defaults to `users.csv` in the script's own directory)

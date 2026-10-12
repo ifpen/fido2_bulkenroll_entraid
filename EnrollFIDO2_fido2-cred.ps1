@@ -543,6 +543,7 @@ function Get-ExistingPasskeyCount {
 $script:GraphScopes = @(
     'UserAuthenticationMethod.ReadWrite.All',
     'Mail.Send',
+    'Mail.Send.Shared',       # envoi depuis la boite partagee (droit Send As)
     'GroupMember.Read.All',   # recherche de groupes + lecture des membres
     'User.Read.All'           # lecture de accountEnabled
 )
@@ -697,58 +698,85 @@ function Show-GroupPicker {
 }
 
 # =====================================================================
-#  Tenant ID en registre
+#  Configuration persistante en registre (Tenant ID, adresse d'expediteur)
 # =====================================================================
 $regPath = "HKCU:\Software\Token2BulkFido"
-$propertyName = "TenantId"
-$defaultValue = "votretenant.onmicrosoft.com"   # <-- valeur par defaut a adapter
 
+# Cree uniquement la cle si absente : aucune valeur n'est imposee/ecrasee
+# (champ vide si non configure).
 if (-not (Test-Path $regPath)) {
     New-Item -Path $regPath -Force | Out-Null
 }
-try {
-    $null = Get-ItemProperty -Path $regPath -Name $propertyName -ErrorAction Stop
-} catch {
-    New-ItemProperty -Path $regPath -Name $propertyName -Value $defaultValue -PropertyType String -Force | Out-Null
+
+# Lit une valeur String du registre ; '' si absente ou illisible.
+function Get-RegistrySetting {
+    param([Parameter(Mandatory)][string] $Name)
+    try {
+        $item = Get-ItemProperty -Path $regPath -Name $Name -ErrorAction Stop
+        return [string]$item.$Name
+    } catch {
+        return ''
+    }
+}
+
+# Ancienne valeur par defaut fictive : on ne la propose pas au technicien.
+$script:FakeTenantDefaults = @('votretenant.onmicrosoft.com', 'token2.onmicrosoft.com')
+
+# Validation simple d'une adresse e-mail
+function Test-EmailAddress {
+    param([string] $Address)
+    return ($Address -match '^[^@\s]+@[^@\s]+\.[^@\s]+$')
 }
 
 # =====================================================================
-#  Envoi du PIN temporaire par mail (delegue : depuis la boite du
-#  compte connecte a Graph). Retourne $true si l'envoi a reussi.
+#  Envoi d'un mail depuis une boite partagee (no-reply) via Graph.
+#  Prerequis : droit Send As sur la boite (direct ou via un groupe de
+#  securite a extension messagerie) + scope delegue Mail.Send.Shared.
 # =====================================================================
+function Send-NoReplyMail {
+    param(
+        [Parameter(Mandatory)][string] $To,
+        [Parameter(Mandatory)][string] $Subject,
+        [Parameter(Mandatory)][string] $Body,   # HTML
+        [Parameter(Mandatory)][string] $From
+    )
+    $endpoint = Get-MgGraphEndpoint
+    $mail = @{
+        message = @{
+            subject      = $Subject
+            body         = @{ contentType = 'HTML'; content = $Body }
+            toRecipients = @(@{ emailAddress = @{ address = $To } })
+        }
+        saveToSentItems = $false
+    } | ConvertTo-Json -Depth 6
+
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "$endpoint/v1.0/users/$([uri]::EscapeDataString($From))/sendMail" `
+        -ContentType 'application/json' -Body $mail
+}
+
+# Envoi du PIN temporaire au collaborateur (la cle physique est remise
+# separement) depuis l'adresse d'expediteur configuree.
 function Send-PinMail {
     param(
         [Parameter(Mandatory)][string] $ToUpn,
         [Parameter(Mandatory)][string] $Pin,
-        [Parameter(Mandatory)][string] $Serial
+        [Parameter(Mandatory)][string] $Serial,
+        [Parameter(Mandatory)][string] $From
     )
     $subject = "Votre cle de securite FIDO2 - code PIN temporaire"
+    $serialHtml = [System.Net.WebUtility]::HtmlEncode($Serial)
+    $pinHtml    = [System.Net.WebUtility]::HtmlEncode($Pin)
 
     $body = @"
-Bonjour,
-
-Votre clé de sécurité FIDO2 (numéro de série : $Serial) vient d'être préparée.
-
-Votre code PIN temporaire est : $Pin
-
-IMPORTANT : lors de votre première utilisation, il vous sera demandé de remplacer ce code temporaire par un code PIN personnel de votre choix.
-
-Ne communiquez ce code à personne.
-
-Cordialement,
-
-Sécurité IFPEN
+<p>Bonjour,</p>
+<p>Votre clé de sécurité FIDO2 (numéro de série : <b>$serialHtml</b>) vient d'être préparée. Elle vous sera remise séparément.</p>
+<p>Votre code PIN temporaire est : <b>$pinHtml</b></p>
+<p><b>IMPORTANT :</b> lors de votre première utilisation, il vous sera demandé de remplacer ce code temporaire par un code PIN personnel de votre choix. Merci de le changer dès réception de la clé.</p>
+<p>Ne communiquez ce code à personne.</p>
+<p>Cordialement,<br/>Sécurité IFPEN</p>
 "@
-    $payload = @{
-        message = @{
-            subject = $subject
-            body = @{ contentType = "Text"; content = $body }
-            toRecipients = @(@{ emailAddress = @{ address = $ToUpn } })
-        }
-        saveToSentItems = $true
-    }
-    # /me/sendMail : envoie depuis la boite du compte connecte
-    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/me/sendMail" -Body $payload
+    Send-NoReplyMail -To $ToUpn -Subject $subject -Body $body -From $From
 }
 
 # =====================================================================
@@ -773,13 +801,27 @@ $textTenantId.Location = New-Object System.Drawing.Point(160, 20)
 $textTenantId.Width = 320
 $form.Controls.Add($textTenantId)
 
-try {
-    $tenantIdFromRegistry = (Get-ItemProperty -Path $regPath -Name "TenantId").TenantId
-    if (-not [string]::IsNullOrWhiteSpace($tenantIdFromRegistry)) {
-        $textTenantId.Text = $tenantIdFromRegistry
-    }
-} catch {
-    Write-Host "Impossible de lire l'ID du tenant depuis le registre : $_"
+$tenantIdFromRegistry = Get-RegistrySetting -Name 'TenantId'
+if (-not [string]::IsNullOrWhiteSpace($tenantIdFromRegistry) -and
+    $script:FakeTenantDefaults -notcontains $tenantIdFromRegistry.Trim()) {
+    $textTenantId.Text = $tenantIdFromRegistry.Trim()
+}
+
+# --- Adresse d'expediteur des mails (boite partagee no-reply) ---
+$labelSender = New-Object System.Windows.Forms.Label
+$labelSender.Text = "Adresse d'expéditeur :"
+$labelSender.AutoSize = $true
+$labelSender.Location = New-Object System.Drawing.Point(20, 52)
+$form.Controls.Add($labelSender)
+
+$textSender = New-Object System.Windows.Forms.TextBox
+$textSender.Location = New-Object System.Drawing.Point(160, 50)
+$textSender.Width = 320
+$form.Controls.Add($textSender)
+
+$senderFromRegistry = Get-RegistrySetting -Name 'SenderAddress'
+if (-not [string]::IsNullOrWhiteSpace($senderFromRegistry)) {
+    $textSender.Text = $senderFromRegistry.Trim()
 }
 
 # --- Source des utilisateurs : fichier CSV ou groupe Entra ID ---
@@ -787,26 +829,26 @@ $rbCsv = New-Object System.Windows.Forms.RadioButton
 $rbCsv.Text = "Fichier CSV"
 $rbCsv.AutoSize = $true
 $rbCsv.Checked = $true
-$rbCsv.Location = New-Object System.Drawing.Point(20, 55)
+$rbCsv.Location = New-Object System.Drawing.Point(20, 85)
 $form.Controls.Add($rbCsv)
 
 $rbGroup = New-Object System.Windows.Forms.RadioButton
 $rbGroup.Text = "Groupe Entra ID (utilisateurs actifs)"
 $rbGroup.AutoSize = $true
-$rbGroup.Location = New-Object System.Drawing.Point(160, 55)
+$rbGroup.Location = New-Object System.Drawing.Point(160, 85)
 $form.Controls.Add($rbGroup)
 
 # --- Fichier CSV des utilisateurs ---
 $btnSelectFile = New-Object System.Windows.Forms.Button
 $btnSelectFile.Text = "Fichier CSV..."
 $btnSelectFile.Width = 120
-$btnSelectFile.Location = New-Object System.Drawing.Point(20, 85)
+$btnSelectFile.Location = New-Object System.Drawing.Point(20, 115)
 $form.Controls.Add($btnSelectFile)
 
 $labelFilePath = New-Object System.Windows.Forms.Label
 $labelFilePath.AutoSize = $true
 $labelFilePath.MaximumSize = New-Object System.Drawing.Size(320, 0)
-$labelFilePath.Location = New-Object System.Drawing.Point(160, 90)
+$labelFilePath.Location = New-Object System.Drawing.Point(160, 120)
 $labelFilePath.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $labelFilePath.Text = "(aucun fichier sélectionné)"
 $form.Controls.Add($labelFilePath)
@@ -816,13 +858,13 @@ $btnSelectGroup = New-Object System.Windows.Forms.Button
 $btnSelectGroup.Text = "Choisir un groupe..."
 $btnSelectGroup.Width = 120
 $btnSelectGroup.Enabled = $false
-$btnSelectGroup.Location = New-Object System.Drawing.Point(20, 120)
+$btnSelectGroup.Location = New-Object System.Drawing.Point(20, 150)
 $form.Controls.Add($btnSelectGroup)
 
 $labelGroup = New-Object System.Windows.Forms.Label
 $labelGroup.AutoSize = $true
 $labelGroup.MaximumSize = New-Object System.Drawing.Size(320, 0)
-$labelGroup.Location = New-Object System.Drawing.Point(160, 125)
+$labelGroup.Location = New-Object System.Drawing.Point(160, 155)
 $labelGroup.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $labelGroup.Text = "(aucun groupe sélectionné)"
 $form.Controls.Add($labelGroup)
@@ -874,7 +916,7 @@ $btnSelectGroup.Add_Click({
 $chkSetRandomPin = New-Object System.Windows.Forms.CheckBox
 $chkSetRandomPin.Text = "PIN aléatoire (obligatoire)"
 $chkSetRandomPin.AutoSize = $true
-$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 165)
+$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 195)
 $chkSetRandomPin.Checked = $true
 $chkSetRandomPin.Enabled = $false
 $form.Controls.Add($chkSetRandomPin)
@@ -882,7 +924,7 @@ $form.Controls.Add($chkSetRandomPin)
 $chkForcePinChange = New-Object System.Windows.Forms.CheckBox
 $chkForcePinChange.Text = "Changement de PIN obligatoire à la première utilisation"
 $chkForcePinChange.AutoSize = $true
-$chkForcePinChange.Location = New-Object System.Drawing.Point(20, 130)
+$chkForcePinChange.Location = New-Object System.Drawing.Point(20, 220)
 $chkForcePinChange.Checked = $true
 $chkForcePinChange.Enabled = $false
 $form.Controls.Add($chkForcePinChange)
@@ -891,13 +933,13 @@ $form.Controls.Add($chkForcePinChange)
 $btnSetLogDir = New-Object System.Windows.Forms.Button
 $btnSetLogDir.Text = "Paramétrage logs..."
 $btnSetLogDir.Width = 120
-$btnSetLogDir.Location = New-Object System.Drawing.Point(20, 165)
+$btnSetLogDir.Location = New-Object System.Drawing.Point(20, 250)
 $form.Controls.Add($btnSetLogDir)
 
 $labelLogDir = New-Object System.Windows.Forms.Label
 $labelLogDir.AutoSize = $true
 $labelLogDir.MaximumSize = New-Object System.Drawing.Size(320, 0)
-$labelLogDir.Location = New-Object System.Drawing.Point(160, 170)
+$labelLogDir.Location = New-Object System.Drawing.Point(160, 255)
 $labelLogDir.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $labelLogDir.Text = $script:LogDir
 $form.Controls.Add($labelLogDir)
@@ -917,7 +959,7 @@ $lblInstruction = New-Object System.Windows.Forms.Label
 $lblInstruction.Text = "Branchez la clé du premier utilisateur avant de commencer`n(ou utilisez le NFC pour limiter les manipulations)"
 $lblInstruction.Font = New-Object System.Drawing.Font('Microsoft Sans Serif', 10)
 $lblInstruction.AutoSize = $true
-$lblInstruction.Location = New-Object System.Drawing.Point(20, 215)
+$lblInstruction.Location = New-Object System.Drawing.Point(20, 295)
 $form.Controls.Add($lblInstruction)
 
 # --- Bouton principal ---
@@ -926,18 +968,25 @@ $btnProceed.Text = "Démarrer"
 $btnProceed.Width = 220
 $btnProceed.Height = 40
 $btnProceed.Font = New-Object System.Drawing.Font('Microsoft Sans Serif', 12)
-$btnProceed.Location = New-Object System.Drawing.Point(20, 270)
+$btnProceed.Location = New-Object System.Drawing.Point(20, 345)
 $form.Controls.Add($btnProceed)
 
 $btnProceed.Add_Click({
     Write-Host "Verification des donnees saisies"
 
     try {
-        $tenantId = $textTenantId.Text
+        $tenantId = $textTenantId.Text.Trim()
+        $senderAddress = $textSender.Text.Trim()
         $filePath = $labelFilePath.Text
 
         if (-not $tenantId) {
             [System.Windows.Forms.MessageBox]::Show("Veuillez saisir l'ID du tenant.", "Erreur")
+            $form.Visible = $true
+            return
+        }
+
+        if (-not (Test-EmailAddress $senderAddress)) {
+            [System.Windows.Forms.MessageBox]::Show("Veuillez saisir une adresse d'expéditeur valide (ex. no-reply-mfa@example.com).", "Erreur")
             $form.Visible = $true
             return
         }
@@ -954,7 +1003,10 @@ $btnProceed.Add_Click({
             return
         }
 
-        Set-ItemProperty -Path $regPath -Name "TenantId" -Value $tenantId -Force
+        # Persistance de la configuration AVANT la connexion Graph
+        Set-ItemProperty -Path $regPath -Name "TenantId" -Value $tenantId -Type String -Force
+        Set-ItemProperty -Path $regPath -Name "SenderAddress" -Value $senderAddress -Type String -Force
+        $script:SenderAddress = $senderAddress
         Connect-GraphIfNeeded -TenantId $tenantId
 
         if ($rbGroup.Checked) {
@@ -1185,23 +1237,27 @@ $btnProceed.Add_Click({
                         $forcedPin = $true
                     }
 
-                    # Envoi du PIN temporaire par mail au collaborateur
+                    # Envoi du PIN temporaire par mail au collaborateur, depuis
+                    # l'adresse d'expediteur configuree. Un echec n'interrompt pas
+                    # l'enrolement : il est trace (console + colonne MailSent).
                     $mailSent = $false
+                    $mailDetail = ''
                     try {
-                        Send-PinMail -ToUpn $upn -Pin $randomPin -Serial $serialOutput
+                        Send-PinMail -ToUpn $upn -Pin $randomPin -Serial $serialOutput -From $script:SenderAddress
                         $mailSent = $true
-                        Write-Host "Mail envoye a $upn."
+                        Write-Host "Mail envoye a $upn depuis $($script:SenderAddress)."
                     } catch {
                         $mailErr = $_.Exception.Message
                         if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $mailErr = "$mailErr | $($_.ErrorDetails.Message)" }
-                        Write-Host "Echec envoi mail a $upn : $mailErr"
+                        Write-Host "Echec envoi mail a $upn depuis $($script:SenderAddress) : $mailErr"
+                        $mailDetail = "Mail non envoye : $mailErr"
                     }
 
                     # Journalisation du succes. PIN NON stocke (transmis par mail,
                     # ephemere + Force PIN Change) : seul MailSent est trace.
                     Write-EnrollmentLog -Upn $upn -Serial $serialOutput -Pin '' `
                         -ForcedPinChange $forcedPin -Statut 'Succes' `
-                        -MailSent $mailSent -CredentialId $credentialId
+                        -MailSent $mailSent -CredentialId $credentialId -Detail $mailDetail
                     Write-Host "Resultat journalise pour $upn."
 
                     if ($currentIndex -lt $totalUsers) {
