@@ -547,18 +547,23 @@ $script:GraphScopes = @(
     'User.Read.All'           # lecture de accountEnabled
 )
 
-# Se connecte a Graph uniquement si aucun contexte n'existe ou si des scopes manquent.
+# Se connecte a Graph uniquement si aucun contexte n'existe, si des scopes manquent
+# ou si le tenant saisi a change depuis la derniere connexion.
+$script:GraphTenant = $null
 function Connect-GraphIfNeeded {
     param([Parameter(Mandatory)][string] $TenantId)
     $ctx = Get-MgContext -ErrorAction SilentlyContinue
     $missing = if ($ctx) { @($script:GraphScopes | Where-Object { $ctx.Scopes -notcontains $_ }) } else { $script:GraphScopes }
-    if (-not $ctx -or $missing.Count -gt 0) {
+    $tenantChanged = ($script:GraphTenant -and $script:GraphTenant -ne $TenantId)
+    if (-not $ctx -or $missing.Count -gt 0 -or $tenantChanged) {
         Write-Host "Connexion a Microsoft Graph"
         Connect-MgGraph -Scopes $script:GraphScopes -TenantId $TenantId -NoWelcome
     }
+    $script:GraphTenant = $TenantId
 }
 
 # Recherche de groupes Entra par nom (recherche "contient un mot" via $search)
+# $script:LastGroupSearchTotal : nombre total de groupes correspondants (@odata.count)
 function Search-EntraGroup {
     param([Parameter(Mandatory)][string] $Text)
     $safe = $Text.Replace('"', '')
@@ -567,6 +572,7 @@ function Search-EntraGroup {
            "&`$select=id,displayName,description,mail,groupTypes,securityEnabled" +
            "&`$orderby=displayName&`$top=100&`$count=true"
     $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' }
+    $script:LastGroupSearchTotal = $resp.'@odata.count'
     return @($resp.value)
 }
 
@@ -590,6 +596,7 @@ function Get-EntraGroupActiveUserUpns {
 
 # Fenetre de recherche/selection de groupe. Retourne @{Id;DisplayName} ou $null.
 function Show-GroupPicker {
+    param([System.Windows.Forms.IWin32Window] $Owner)
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = "Rechercher un groupe Entra ID"
     $dlg.Size = New-Object System.Drawing.Size(620, 440)
@@ -664,6 +671,9 @@ function Show-GroupPicker {
                 [void]$lv.Items.Add($item)
             }
             $lblStatus.Text = "$($groups.Count) groupe(s) trouvé(s)."
+            if ($script:LastGroupSearchTotal -and $script:LastGroupSearchTotal -gt $groups.Count) {
+                $lblStatus.Text = "$($groups.Count) premiers groupes affichés sur $($script:LastGroupSearchTotal) : affinez la recherche."
+            }
         } catch {
             $lblStatus.Text = "Erreur : $($_.Exception.Message)"
         }
@@ -677,7 +687,7 @@ function Show-GroupPicker {
         }
     })
 
-    $result = $dlg.ShowDialog()
+    $result = if ($Owner) { $dlg.ShowDialog($Owner) } else { $dlg.ShowDialog() }
     $selected = $null
     if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $lv.SelectedItems.Count -eq 1) {
         $selected = $lv.SelectedItems[0].Tag
@@ -819,6 +829,14 @@ $form.Controls.Add($labelGroup)
 
 $script:SelectedGroup = $null
 
+# Le groupe selectionne appartient au tenant courant : on l'oublie si le tenant change
+$textTenantId.Add_TextChanged({
+    if ($script:SelectedGroup) {
+        $script:SelectedGroup = $null
+        $labelGroup.Text = "(aucun groupe sélectionné)"
+    }
+})
+
 $updateSource = {
     $btnSelectFile.Enabled  = $rbCsv.Checked
     $btnSelectGroup.Enabled = $rbGroup.Checked
@@ -842,7 +860,7 @@ $btnSelectGroup.Add_Click({
     }
     try {
         Connect-GraphIfNeeded -TenantId $textTenantId.Text
-        $g = Show-GroupPicker
+        $g = Show-GroupPicker -Owner $form
         if ($g) {
             $script:SelectedGroup = $g
             $labelGroup.Text = "$($g.DisplayName)`n($($g.Id))"
