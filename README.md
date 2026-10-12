@@ -33,13 +33,19 @@ Ensure the following files are included in the archive:
 - `libfido2-ui.exe`: Dependency of `fido2-manage.exe`.
 - `fido2-cred2.exe`: Tool to create credentials directly on FIDO keys, compiled for NFC support to bypass Windows Hello.
 
-### Input File
-A CSV file containing user information. The file must include a column named `UPN` (User Principal Name).
+### Input (users to enroll)
+Either:
+- A CSV file containing user information. The file must include a column named `UPN` (User Principal Name).
+- Or (`EnrollFIDO2_fido2-cred.ps1` only) an **Entra ID group**: all **active** users (`accountEnabled = true`) of the group, including members of nested groups, are enrolled. A search window helps you find the group by name.
 
 ### Permissions
 - Run the script as **Administrator** (required due to Windows FIDO2 Native API limitations).
-- The Entra account used must have the following **Graph API permissions**:
+- The Entra account used must have the following **Graph API permissions** (delegated):
   - `UserAuthenticationMethod.ReadWrite.All`
+  - `Mail.Send` (`EnrollFIDO2_fido2-cred.ps1`: sends the temporary PIN by mail)
+  - `GroupMember.Read.All` (`EnrollFIDO2_fido2-cred.ps1`: group search and group members)
+  - `User.Read.All` (`EnrollFIDO2_fido2-cred.ps1`: reads `accountEnabled`)
+- `GroupMember.Read.All` and `User.Read.All` usually require **admin consent** in the tenant.
 
 ### Additional Notes
 If your Entra account is FIDO2/Passkey-protected, follow these steps:
@@ -63,6 +69,8 @@ If your Entra account is FIDO2/Passkey-protected, follow these steps:
 
 3. **Select the Input File**:
    Click "Select File" and choose a valid CSV file containing user UPNs. (it defaults to `users.csv` in the script's own directory)
+
+   With `EnrollFIDO2_fido2-cred.ps1`, you can instead select **« Groupe Entra ID (utilisateurs actifs) »**, click **« Choisir un groupe... »**, search the group by name (at least 2 characters) and select it. When you click **« Démarrer »**, the active users of the group are listed and a confirmation is requested before enrollment starts.
 
 4. **Set PIN Options**:
    - **Random PIN**: Generates a random 6-digit PIN for each key.
