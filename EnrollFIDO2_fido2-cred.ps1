@@ -1,6 +1,3 @@
-$samplepin = '1234587'
-
-
 ###region utility functions
 
 ###taken from https://github.com/rmbolger/Posh-ACME/blob/main/Posh-ACME/Private/ConvertTo-Base64Url.ps1 (MIT, Commit 13367d2)
@@ -186,33 +183,37 @@ Ensure-Module -ModuleName "Microsoft.Graph" -InstallCommand "Microsoft.Graph"
 Ensure-Module -ModuleName "DSInternals.PassKeys"
 
 
-# Function to generate a random PIN (8 digits, PIN+ complexity)
-function Generate-RandomPin {
+# Generation de PIN aleatoire 8 chiffres (CSPRNG, tirage AVEC remise)
+# Corrige le bug d'entropie de l'original (Get-Random -Count = sans remise)
+function New-RandomPin {
+    [OutputType([string])]
+    param([int] $Length = 8)
+    # ::Create()/GetBytes : compatible Windows PowerShell 5.1 (.NET Framework)
+    # (la methode statique ::Fill() n'existe qu'a partir de .NET Core / PS 7)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     do {
-        # Generate a random 8-digit PIN
-        $pin = -join ((48..57) | Get-Random -Count 8 | ForEach-Object { [char]$_ })
-        
-        # Check for sequential numbers (ascending or descending) of 6 digits
+        $digits = New-Object System.Collections.Generic.List[int]
+        $b = New-Object byte[] 1
+        while ($digits.Count -lt $Length) {
+            $rng.GetBytes($b)
+            if ($b[0] -lt 250) { $digits.Add($b[0] % 10) }  # rejet anti-biais modulo
+        }
+        $pin = -join $digits
+
+        # Filtres de complexite PIN+
         $isSequential = $false
         for ($i = 0; $i -le ($pin.Length - 6); $i++) {
             $slice = $pin.Substring($i, 6)
             if ('0123456789'.Contains($slice) -or '9876543210'.Contains($slice)) {
-                $isSequential = $true
-                break
+                $isSequential = $true; break
             }
         }
-
-        # Check for repeated digits (4 or more in a row)
         $hasRepeatedDigits = $pin -match '(\d)\1{3,}'
-
-        # Check for palindrome
         $charArray = $pin.ToCharArray()
         [Array]::Reverse($charArray)
-        $reversedPin = -join $charArray
-        $isPalindrome = ($pin -eq $reversedPin)
-
+        $isPalindrome = ($pin -eq (-join $charArray))
     } while ($isSequential -or $hasRepeatedDigits -or $isPalindrome)
-
+    $rng.Dispose()
     return $pin
 }
 
@@ -361,20 +362,37 @@ function CTAP-Create-Custom-Passkey
             $cred = $input | & ".\fido2-cred2.exe" $cli.split()
 
             [console]::OutputEncoding = $oldEncoding
-			#create array from the outputs and extract authenticator data, signature and attestation certificate (x5c) to manually build attestation object
+
+            # Controle : echec de fido2-cred2 (PIN incorrect, cle non touchee,
+            # delai depasse, cle debranchee) -> sortie vide ou code non nul
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$cred")) {
+                throw "fido2-cred2.exe a echoue (code $LASTEXITCODE). Causes probables : PIN incorrect (cle deja initialisee ?), cle non touchee a temps, ou cle debranchee. Sortie brute : $cred"
+            }
+
+			#construit un tableau a partir de la sortie et extrait authenticator data, signature et certificat d'attestation (x5c) pour batir manuellement l'attestation object
 			$credarray=$cred -Split "`n"
-			
+
+            # Controle : la sortie doit contenir au moins 7 lignes exploitables
+            if (@($credarray).Count -lt 7) {
+                throw "Sortie de fido2-cred2.exe inattendue ($(@($credarray).Count) ligne(s)) : impossible d'extraire le credential. Sortie brute : $cred"
+            }
+
 			$authdata=$credarray[3]
 			$sig=$credarray[5]
 			$x5c=$credarray[6]
 			$attobj = build-att-object $sig $authdata $x5c "es256"
 			
-			#pull credential ID as Base64URL to send to Microsoft
+			#recupere le credential ID en Base64URL a envoyer a Microsoft
 			$credid=ConvertTo-Base64Url -FromBase64 $credarray[4]
+
+            # Controle : jamais envoyer un credential vide a Graph (-> 400)
+            if ([string]::IsNullOrWhiteSpace($credid) -or [string]::IsNullOrWhiteSpace($authdata)) {
+                throw "Credential vide apres extraction : la creation sur la cle n'a pas abouti. Sortie brute de fido2-cred2 : $cred"
+            }
 			
-			#Exit
+			#sortie
 			
-			## credential format, sampled from Microsoft Documentation
+			## format du credential, repris de la documentation Microsoft
 			$samplejson2=@"
 			{
 			  "displayName": "Sample",
@@ -436,333 +454,559 @@ function Bring-MainWindowToForeground {
     [User32]::SetForegroundWindow([System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle)
 }
 
-# Import required modules
+# import des modules requis
 Add-Type -AssemblyName System.Windows.Forms
 
-# Global variables
-$serialOutput = "None"
-$logFilePath = "provisioning.log"
+# =====================================================================
+#  Configuration generale
+# =====================================================================
+$script:ScriptVersion = '2.6.0-IFPEN'
 
-# Define Registry Path
-$regPath = "HKCU:\Software\Token2BulkFido"
- 
-$propertyName = "TenantId"
-$defaultValue = "token2.onmicrosoft.com"  # Replace with the default value you want
+# Repertoire des logs : par defaut sous le dossier du script.
+# Cible production : zone reseau dediee avec ACL append-only, ex.
+#   $script:LogDir = '\\SERVEUR\Partage\MFA-Enrollment-Logs'
+$script:LogDir = Join-Path $PSScriptRoot 'Logs'
 
-# Check if the registry path exists
-if (-not (Test-Path $regPath)) {
-    # Create the registry path if it does not exist
-    New-Item -Path $regPath -Force | Out-Null
- 
-}
-# Check if the property exists
-try {
-    $existingProperty = Get-ItemProperty -Path $regPath -Name $propertyName -ErrorAction Stop
-     
-} catch {
-    # Property does not exist; create it
-    New-ItemProperty -Path $regPath -Name $propertyName -Value $defaultValue -PropertyType String -Force | Out-Null
-    Write-Output "Property '$propertyName' created with value: $defaultValue"
+
+$script:LogHeader = 'Horodatage,Technicien,Poste,Collaborateur,NumeroSerie,PIN,ForcePINChange,Statut,MailSent'
+
+# Rotation quotidienne : la date est integree au nom du fichier.
+function Get-EnrollmentLogPath {
+    Join-Path $script:LogDir ("enrollment_{0}.csv" -f (Get-Date -Format 'yyyy-MM-dd'))
 }
 
-# Create the main form
-$form = New-Object System.Windows.Forms.Form
+# Ecriture d'une entree de log (succes, echec ou utilisateur ignore).
+# Compatible ACL append-only : Add-Content uniquement, pas de lecture requise.
+function Write-EnrollmentLog {
+    param(
+        [Parameter(Mandatory)] [string] $Upn,
+        [string] $Serial          = '',
+        [string] $Pin             = '',
+        [bool]   $ForcedPinChange = $false,
+        [Parameter(Mandatory)]
+        [ValidateSet('Succes','Echec','Ignore')]
+        [string] $Statut,
+        [bool]   $MailSent        = $false,
+        [string] $CredentialId    = '',
+        [string] $Detail          = ''
+    )
 
-$form.Text = "FIDO Key Registration"
-$form.Size = New-Object System.Drawing.Size(500, 350)
-$form.StartPosition = "CenterScreen"
+    if (-not (Test-Path $script:LogDir)) {
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+    }
+    $logPath = Get-EnrollmentLogPath
 
-# Create a label and text box for Tenant ID input
-$labelTenant = New-Object System.Windows.Forms.Label
-$labelTenant.Text = "Enter Tenant ID:"
-$labelTenant.Location = New-Object System.Drawing.Point(20, 20)
-$form.Controls.Add($labelTenant)
-
-$textTenantId = New-Object System.Windows.Forms.TextBox
-$textTenantId.Location = New-Object System.Drawing.Point(150, 20)
-$textTenantId.Width = 300
-$form.Controls.Add($textTenantId)
-
-# Retrieve Tenant Name from Registry
-if (-not (Test-Path $regPath)) {
-    New-Item -Path $regPath -Force | Out-Null
-} else {
+    # En-tete si le fichier du jour n'existe pas encore (best effort :
+    # sous ACL append-only stricte, [File]::Exists peut echouer -> ignore)
     try {
-        $tenantIdFromRegistry = (Get-ItemProperty -Path $regPath -Name "TenantId").TenantId
-        if (-not [string]::IsNullOrWhiteSpace($tenantIdFromRegistry)) {
-            $textTenantId.Text = $tenantIdFromRegistry
+        if (-not [System.IO.File]::Exists($logPath)) {
+            Add-Content -Path $logPath -Value $script:LogHeader -Encoding UTF8 -ErrorAction Stop
         }
+    } catch { }
+
+    $statutComplet = if ($Detail) { "$Statut ($Detail)" } else { $Statut }
+
+    $fields = @(
+        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        "$env:USERDOMAIN\$env:USERNAME"
+        $env:COMPUTERNAME
+        $Upn
+        $Serial
+        $Pin
+        $ForcedPinChange
+        $statutComplet
+        $MailSent
+    )
+    $line = ($fields | ForEach-Object { '"' + ("$_" -replace '"','""') + '"' }) -join ','
+
+    try {
+        Add-Content -Path $logPath -Value $line -Encoding UTF8 -ErrorAction Stop
     } catch {
-        Write-Host "Failed to retrieve Tenant ID from registry: $_"
+        # Le log d'audit est obligatoire : on refuse de continuer sans trace.
+        throw "Echec d'ecriture du log d'audit ($logPath) : $($_.Exception.Message)"
     }
 }
 
-# Create a button to select the CSV or text file
+# Retourne le nombre de passkeys FIDO2 deja enregistrees pour un UPN.
+# Scope requis : UserAuthenticationMethod.ReadWrite.All (deja demande au Connect-MgGraph).
+# Leve une exception si l'appel echoue (UPN introuvable, droits, reseau...).
+function Get-ExistingPasskeyCount {
+    param([Parameter(Mandatory)][string] $Upn)
+    $uri = "https://graph.microsoft.com/v1.0/users/$Upn/authentication/fido2Methods"
+    $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+    return @($resp.value).Count
+}
+
+# =====================================================================
+#  Tenant ID en registre
+# =====================================================================
+$regPath = "HKCU:\Software\Token2BulkFido"
+$propertyName = "TenantId"
+$defaultValue = "votretenant.onmicrosoft.com"   # <-- valeur par defaut a adapter
+
+if (-not (Test-Path $regPath)) {
+    New-Item -Path $regPath -Force | Out-Null
+}
+try {
+    $null = Get-ItemProperty -Path $regPath -Name $propertyName -ErrorAction Stop
+} catch {
+    New-ItemProperty -Path $regPath -Name $propertyName -Value $defaultValue -PropertyType String -Force | Out-Null
+}
+
+# =====================================================================
+#  Envoi du PIN temporaire par mail (delegue : depuis la boite du
+#  compte connecte a Graph). Retourne $true si l'envoi a reussi.
+# =====================================================================
+function Send-PinMail {
+    param(
+        [Parameter(Mandatory)][string] $ToUpn,
+        [Parameter(Mandatory)][string] $Pin,
+        [Parameter(Mandatory)][string] $Serial
+    )
+    $subject = "Votre cle de securite FIDO2 - code PIN temporaire"
+
+    $body = @"
+Bonjour,
+
+Votre clé de sécurité FIDO2 (numéro de série : $Serial) vient d'être préparée.
+
+Votre code PIN temporaire est : $Pin
+
+IMPORTANT : lors de votre première utilisation, il vous sera demandé de remplacer ce code temporaire par un code PIN personnel de votre choix.
+
+Ne communiquez ce code à personne.
+
+Cordialement,
+
+Sécurité IFPEN
+"@
+    $payload = @{
+        message = @{
+            subject = $subject
+            body = @{ contentType = "Text"; content = $body }
+            toRecipients = @(@{ emailAddress = @{ address = $ToUpn } })
+        }
+        saveToSentItems = $true
+    }
+    # /me/sendMail : envoie depuis la boite du compte connecte
+    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/me/sendMail" -Body $payload
+}
+
+# =====================================================================
+#  Interface principale (francais)
+# =====================================================================
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Enrôlement des clés FIDO2"
+$form.Size = New-Object System.Drawing.Size(520, 400)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+$form.MaximizeBox = $false
+
+# --- Tenant ID ---
+$labelTenant = New-Object System.Windows.Forms.Label
+$labelTenant.Text = "ID du tenant :"
+$labelTenant.AutoSize = $true
+$labelTenant.Location = New-Object System.Drawing.Point(20, 22)
+$form.Controls.Add($labelTenant)
+
+$textTenantId = New-Object System.Windows.Forms.TextBox
+$textTenantId.Location = New-Object System.Drawing.Point(160, 20)
+$textTenantId.Width = 320
+$form.Controls.Add($textTenantId)
+
+try {
+    $tenantIdFromRegistry = (Get-ItemProperty -Path $regPath -Name "TenantId").TenantId
+    if (-not [string]::IsNullOrWhiteSpace($tenantIdFromRegistry)) {
+        $textTenantId.Text = $tenantIdFromRegistry
+    }
+} catch {
+    Write-Host "Impossible de lire l'ID du tenant depuis le registre : $_"
+}
+
+# --- Fichier CSV des utilisateurs ---
 $btnSelectFile = New-Object System.Windows.Forms.Button
-$btnSelectFile.Text = "Select File"
+$btnSelectFile.Text = "Fichier CSV..."
+$btnSelectFile.Width = 120
 $btnSelectFile.Location = New-Object System.Drawing.Point(20, 60)
 $form.Controls.Add($btnSelectFile)
 
-# Create a label to display the selected file path
 $labelFilePath = New-Object System.Windows.Forms.Label
 $labelFilePath.AutoSize = $true
-$labelFilePath.Location = New-Object System.Drawing.Point(150, 65)
+$labelFilePath.MaximumSize = New-Object System.Drawing.Size(320, 0)
+$labelFilePath.Location = New-Object System.Drawing.Point(160, 65)
 $labelFilePath.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$labelFilePath.Text = "(aucun fichier sélectionné)"
 $form.Controls.Add($labelFilePath)
 
-# Create a checkbox for setting a random PIN
-$chkSetRandomPin = New-Object System.Windows.Forms.CheckBox
-$chkSetRandomPin.Text = "Set Random PIN (otherwise $samplepin will be used)"
-$chkSetRandomPin.Width = 300  # Set the width to 200 pixels
-$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 100)
-$form.Controls.Add($chkSetRandomPin)
-
-# Add a checkbox for "Copy generated PIN to clipboard"
-$checkBoxCopyToClipboard = New-Object System.Windows.Forms.CheckBox
-$checkBoxCopyToClipboard.Text = "Copy generated PIN to clipboard"
-$checkBoxCopyToClipboard.AutoSize = $true
-$checkBoxCopyToClipboard.Location = New-Object System.Drawing.Point(20, 140) # Adjust as needed
-
-$form.Controls.Add($checkBoxCopyToClipboard)
-
-
-# Create a checkbox for forcing PIN change
-$chkForcePinChange = New-Object System.Windows.Forms.CheckBox
-$chkForcePinChange.Text = "Force PIN Change"
-$chkForcePinChange.Width = 200  # Set the width to 200 pixels
-$chkForcePinChange.Location = New-Object System.Drawing.Point(20, 120)
-$form.Controls.Add($chkForcePinChange)
-
-# Create a button to set the log file path
-$btnSetLogFile = New-Object System.Windows.Forms.Button
-$btnSetLogFile.Text = "Set Log File"
-$btnSetLogFile.Location = New-Object System.Drawing.Point(20, 180)
-$form.Controls.Add($btnSetLogFile)
-
-# Create a label to display the selected log file path
-$labelLogFilePath = New-Object System.Windows.Forms.Label
-$labelLogFilePath.Text = $logFilePath
-$labelLogFilePath.AutoSize = $true
-$labelLogFilePath.Location = New-Object System.Drawing.Point(150, 180)
-$labelLogFilePath.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-$form.Controls.Add($labelLogFilePath)
-
-# Define file selection logic
 $btnSelectFile.Add_Click({
     $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-    $openFileDialog.Filter =  "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+    $openFileDialog.Filter = "Fichiers CSV (*.csv)|*.csv|Tous les fichiers (*.*)|*.*"
+    $openFileDialog.Title = "Sélectionner le fichier CSV des utilisateurs (colonne UPN)"
     if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         $labelFilePath.Text = $openFileDialog.FileName
     }
 })
 
-# Define log file selection logic
-$btnSetLogFile.Add_Click({
-    $saveFileDialog = New-Object System.Windows.Forms.SaveFileDialog
-    $saveFileDialog.Filter = "Log files (*.log)|*.log|Text files (*.txt)|*.txt|All files (*.*)|*.*"
-    $saveFileDialog.DefaultExt = "csv"
-    if ($saveFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        $labelLogFilePath.Text = $saveFileDialog.FileName
-        $logFilePath = $saveFileDialog.FileName
+# --- Options de securite : IMPOSEES (cochees et verrouillees) ---
+$chkSetRandomPin = New-Object System.Windows.Forms.CheckBox
+$chkSetRandomPin.Text = "PIN aléatoire (obligatoire)"
+$chkSetRandomPin.AutoSize = $true
+$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 105)
+$chkSetRandomPin.Checked = $true
+$chkSetRandomPin.Enabled = $false
+$form.Controls.Add($chkSetRandomPin)
+
+$chkForcePinChange = New-Object System.Windows.Forms.CheckBox
+$chkForcePinChange.Text = "Changement de PIN obligatoire à la première utilisation"
+$chkForcePinChange.AutoSize = $true
+$chkForcePinChange.Location = New-Object System.Drawing.Point(20, 130)
+$chkForcePinChange.Checked = $true
+$chkForcePinChange.Enabled = $false
+$form.Controls.Add($chkForcePinChange)
+
+# --- Repertoire des logs ---
+$btnSetLogDir = New-Object System.Windows.Forms.Button
+$btnSetLogDir.Text = "Paramétrage logs..."
+$btnSetLogDir.Width = 120
+$btnSetLogDir.Location = New-Object System.Drawing.Point(20, 165)
+$form.Controls.Add($btnSetLogDir)
+
+$labelLogDir = New-Object System.Windows.Forms.Label
+$labelLogDir.AutoSize = $true
+$labelLogDir.MaximumSize = New-Object System.Drawing.Size(320, 0)
+$labelLogDir.Location = New-Object System.Drawing.Point(160, 170)
+$labelLogDir.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$labelLogDir.Text = $script:LogDir
+$form.Controls.Add($labelLogDir)
+
+$btnSetLogDir.Add_Click({
+    $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $folderDialog.Description = "Choisir le répertoire des fichiers de log"
+    if ($folderDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        # $script: obligatoire : une affectation simple resterait locale au handler
+        $script:LogDir = $folderDialog.SelectedPath
+        $labelLogDir.Text = $script:LogDir
     }
 })
 
-
-
-
-# Define the Instruction Label
+# --- Instructions ---
 $lblInstruction = New-Object System.Windows.Forms.Label
-$lblInstruction.Text = "plug the first user's key before proceeding`n(or use NFC for fewer interactions)"
+$lblInstruction.Text = "Branchez la clé du premier utilisateur avant de commencer`n(ou utilisez le NFC pour limiter les manipulations)"
 $lblInstruction.Font = New-Object System.Drawing.Font('Microsoft Sans Serif', 10)
 $lblInstruction.AutoSize = $true
-$lblInstruction.Location = New-Object System.Drawing.Point(20, 220)
+$lblInstruction.Location = New-Object System.Drawing.Point(20, 215)
 $form.Controls.Add($lblInstruction)
 
-# Define Proceed button logic
+# --- Bouton principal ---
 $btnProceed = New-Object System.Windows.Forms.Button
-$btnProceed.Text = "Proceed"
-$btnProceed.Width = 200
+$btnProceed.Text = "Démarrer"
+$btnProceed.Width = 220
+$btnProceed.Height = 40
 $btnProceed.Font = New-Object System.Drawing.Font('Microsoft Sans Serif', 12)
-$btnProceed.Location = New-Object System.Drawing.Point(20, 260)  # Adjusted lower than the label
+$btnProceed.Location = New-Object System.Drawing.Point(20, 270)
 $form.Controls.Add($btnProceed)
 
-         ##################           TESTING         ############################
-		 $labelFilePath.Text="$PSScriptRoot\users.csv"
-
-
- 
- $btnProceed.Add_Click({
-    Write-Host "Checking entered data"
-	    $form.Visible = $false
+$btnProceed.Add_Click({
+    Write-Host "Verification des donnees saisies"
 
     try {
         $tenantId = $textTenantId.Text
         $filePath = $labelFilePath.Text
-        
+
         if (-not $tenantId) {
-            [System.Windows.Forms.MessageBox]::Show("Please enter a Tenant ID.", "Error")
-			$form.Visible = $true
+            [System.Windows.Forms.MessageBox]::Show("Veuillez saisir l'ID du tenant.", "Erreur")
+            $form.Visible = $true
             return
         }
 
         if (-not $filePath -or -not (Test-Path $filePath)) {
-            [System.Windows.Forms.MessageBox]::Show("Please select a valid CSV file.", "Error")
-			$form.Visible = $true
+            [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un fichier CSV valide.", "Erreur")
+            $form.Visible = $true
             return
         }
 
         Set-ItemProperty -Path $regPath -Name "TenantId" -Value $tenantId -Force
-		Write-Host "Connecting to MSGraph"
-        Connect-MgGraph -Scopes 'UserAuthenticationMethod.ReadWrite.All' -TenantId $tenantId -NoWelcome
+        Write-Host "Connexion a Microsoft Graph"
+        Connect-MgGraph -Scopes 'UserAuthenticationMethod.ReadWrite.All','Mail.Send' -TenantId $tenantId -NoWelcome
 
         $upns = Import-Csv $filePath | Select-Object -ExpandProperty UPN
-		$totalUsers = $upns.Count
-		$currentIndex = 0
+        $totalUsers = $upns.Count
+        $currentIndex = 0
+        $script:StopRequested = $false   # arret volontaire par l'operateur
+
         foreach ($upn in $upns) {
             if (-not $upn) { continue }
-			    $currentIndex++
 
-            # Fetch the serial number using read_serial_t2.ps1
+            # Arret demande : on sort proprement de la boucle (aucun enrolement
+            # n'est en cours a ce point, la sortie est sans risque).
+            if ($script:StopRequested) {
+                Write-Host "Arret demande par l'operateur. Utilisateurs restants non traites."
+                break
+            }
+
+            $currentIndex++
+
+            # --- Pre-controle : le compte a-t-il deja une passkey ? ---
+            # Evite toute manipulation (popup, lecture de serie) pour les
+            # comptes deja enroles ou introuvables : ignore et journalise.
             try {
-                $serialOutput = (& ".\read_serial_t2.ps1").Trim()
-                if ([string]::IsNullOrWhiteSpace($serialOutput) -or $serialOutput -eq "None") {
-                    [System.Windows.Forms.MessageBox]::Show("No valid serial number detected.`nSkipping.`nPlease prepare next user's key.", "Error")
-                    Write-Host "No valid serial number for $upn. Skipping"
+                $existingCount = Get-ExistingPasskeyCount -Upn $upn
+                if ($existingCount -gt 0) {
+                    Write-Host "$upn : $existingCount passkey(s) deja enregistree(s), utilisateur ignore."
+                    Write-EnrollmentLog -Upn $upn -Statut 'Ignore' -Detail "Passkey deja existante ($existingCount)"
                     continue
                 }
             } catch {
-                [System.Windows.Forms.MessageBox]::Show("Error reading serial number.`nSkipping.`nPlease prepare next user's key.", "Error")
-                Write-Host "Error reading serial number for $upn"
+                Write-Host "$upn : verification impossible ($($_.Exception.Message)), utilisateur ignore."
+                Write-EnrollmentLog -Upn $upn -Statut 'Ignore' -Detail "Verification impossible : $($_.Exception.Message)"
                 continue
             }
 
-            $randomPin = $null
-            if ($chkSetRandomPin.Checked) {
-                $randomPin = Generate-RandomPin
-				# Copy generated PIN to clipboard if the checkbox is checked
-				if ($checkBoxCopyToClipboard.Checked) {
-					Write-Host "Set PIN to ClipBoard $randomPin"
-					Set-Clipboard -Value $randomPin
-				}
+            # --- Sequence de changement de cle (garantit un serie unique) ---
+            # Etape 1 : exiger le retrait de TOUTE cle avant de continuer.
+            # Etape 2 : exiger l'insertion d'UNE seule cle, puis lire le serie
+            # avec l'expression d'origine (qui renvoie le serie complet).
+            # Une cle est "presente" si read_serial_t2 renvoie autre chose que
+            # vide/None ; "plusieurs cles" si la sortie contient une virgule.
+            $serialOutput = $null
+            $skipUser = $false
+
+            # Etape 1 : attendre poste a vide
+            while ($true) {
+                $chk = (& "$PSScriptRoot\read_serial_t2.exe" 2>$null)
+                $chk = if ($null -ne $chk) { ("$chk").Trim() } else { '' }
+                if ([string]::IsNullOrWhiteSpace($chk) -or $chk -eq 'None') { break }  # poste a vide
+                $res = [System.Windows.Forms.MessageBox]::Show(
+                    "Prochain collaborateur : $upn`n`n" +
+                    "ETAPE 1 - Retirez la cle actuellement branchee.`n`n" +
+                    "Cliquez sur OK une fois la cle retiree, ou Annuler pour arreter.",
+                    "Retirez la cle",
+                    [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+                    [System.Windows.Forms.MessageBoxIcon]::Information)
+                if ($res -eq [System.Windows.Forms.DialogResult]::Cancel) {
+                    $script:StopRequested = $true
+                    $skipUser = $true
+                    break
+                }
             }
-			else {
-				$randomPin = $samplepin
-			}
+            if ($skipUser) {
+                Write-EnrollmentLog -Upn $upn -Statut 'Ignore' -Detail "Non enrole - arret demande avant lecture"
+                continue
+            }
 
-            # Create an intermediate popup for the user
+            # Etape 2 : attendre l'insertion d'UNE seule cle et lire le serie
+            while ($true) {
+                $res = [System.Windows.Forms.MessageBox]::Show(
+                    "Collaborateur : $upn`n`n" +
+                    "ETAPE 2 - Branchez la cle de ce collaborateur.`n`n" +
+                    "Cliquez sur OK une fois la cle branchee, ou Annuler pour ignorer cet utilisateur.",
+                    "Branchez la cle",
+                    [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+                    [System.Windows.Forms.MessageBoxIcon]::Information)
+                if ($res -eq [System.Windows.Forms.DialogResult]::Cancel) {
+                    Write-Host "$upn : insertion annulee, utilisateur ignore."
+                    Write-EnrollmentLog -Upn $upn -Statut 'Ignore' -Detail "Cle non branchee (annule par operateur)"
+                    $skipUser = $true
+                    break
+                }
+                # Lecture avec l'expression d'origine (serie complet, non decoupe)
+                $raw = (& "$PSScriptRoot\read_serial_t2.exe").Trim()
+                if ([string]::IsNullOrWhiteSpace($raw) -or $raw -eq 'None') {
+                    [System.Windows.Forms.MessageBox]::Show("Aucune cle detectee. Branchez la cle avant de cliquer sur OK.", "Aucune cle")
+                    continue
+                }
+                if ($raw -match ',') {
+                    [System.Windows.Forms.MessageBox]::Show("Plusieurs cles detectees ($raw).`nNe laissez qu'UNE seule cle branchee, puis reessayez.", "Plusieurs cles")
+                    continue
+                }
+                # exactement une cle : serie complet
+                $serialOutput = $raw
+                break
+            }
+            if ($skipUser -or [string]::IsNullOrWhiteSpace($serialOutput)) { continue }
+
+
+            # Detection du numero de device pour fido2-manage (evite -device 1 en dur).
+            # fido2-manage -list appelle aussi .\libfido2-ui.exe -> Push-Location.
+            $script:DeviceNumber = 1
+            try {
+                Push-Location $PSScriptRoot
+                try {
+                    $manageList = (& "$PSScriptRoot\fido2-manage.exe" -list 2>&1) | Out-String
+                } finally { Pop-Location }
+                # Recupere le 1er numero de device liste (format "1: <path>" ou "device 1")
+                # Format observe : "Device [1]: TOKEN2 FIDO2 Security Key(...)"
+                $m = [regex]::Match($manageList, '(?im)device\s*\[?\s*(\d+)\s*\]?\s*:')
+                if ($m.Success) { $script:DeviceNumber = [int]$m.Groups[1].Value }
+                Write-Host "Device fido2-manage retenu : $script:DeviceNumber"
+            } catch {
+                Write-Host "Detection du device impossible, valeur par defaut 1 utilisee. ($($_.Exception.Message))"
+            }
+
+            # PIN aleatoire : systematique (option verrouillee)
+            $randomPin = New-RandomPin
+
+            # Fenetre intermediaire pour l'operateur
             $serialPopup = New-Object System.Windows.Forms.Form
-            $serialPopup.Text = "Add Key for $upn"
-            $serialPopup.Size = New-Object System.Drawing.Size(400, 200)
+            $serialPopup.Text = "Enrôlement de la clé pour $upn"
+            $serialPopup.Size = New-Object System.Drawing.Size(440, 260)
             $serialPopup.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-			 
-            #$serialPopup.TopMost = $true
 
+            # NOTE etape ulterieure (envoi du PIN par mail) : cet affichage du
+            # PIN sera supprime pour retirer toute visibilite cote technicien.
             $serialLabel = New-Object System.Windows.Forms.Label
-            $serialLabel.Text = "Serial Number: $serialOutput`nUser: $upn`nPIN: $randomPin"
+            $serialLabel.Text = "Numéro de série : $serialOutput`nUtilisateur : $upn"
             $serialLabel.AutoSize = $true
             $serialPopup.Controls.Add($serialLabel)
-            
+
             $infoLabel = New-Object System.Windows.Forms.Label
             $infoLabel.Font = New-Object System.Drawing.Font('Microsoft Sans Serif', 12)
-            $infoLabel.Text = "If the Key blinks, touch it at the metal area."
-            $infoLabel.Location = New-Object System.Drawing.Point(50, 50)
-            $infoLabel.Size = New-Object System.Drawing.Size(400, 50)
+            $infoLabel.Text = "Si la clé clignote, touchez la zone métallique."
+            $infoLabel.Location = New-Object System.Drawing.Point(20, 60)
+            $infoLabel.Size = New-Object System.Drawing.Size(380, 30)
             $serialPopup.Controls.Add($infoLabel)
 
-			$infoLabel2 = New-Object System.Windows.Forms.Label
-            $infoLabel2.Text = "(Or close this window to skip this user)"
-            $infoLabel2.Location = New-Object System.Drawing.Point(0, 130)
-            $infoLabel2.Size = New-Object System.Drawing.Size(400, 20)
+            $infoLabel2 = New-Object System.Windows.Forms.Label
+            $infoLabel2.Text = "(Fermez cette fenêtre pour ignorer cet utilisateur)"
+            $infoLabel2.Location = New-Object System.Drawing.Point(20, 150)
+            $infoLabel2.Size = New-Object System.Drawing.Size(380, 20)
             $serialPopup.Controls.Add($infoLabel2)
 
             $btnAddKey = New-Object System.Windows.Forms.Button
-            $btnAddKey.Text = "Add Key"
-            $btnAddKey.Location = New-Object System.Drawing.Point(20, 100)
+            $btnAddKey.Text = "Initialiser la clé"
+            $btnAddKey.Width = 120
+            $btnAddKey.Location = New-Object System.Drawing.Point(20, 105)
             $serialPopup.Controls.Add($btnAddKey)
 
+            # Bouton d'arret : stoppe la campagne apres cet utilisateur.
+            $btnStop = New-Object System.Windows.Forms.Button
+            $btnStop.Text = "Arrêter la campagne"
+            $btnStop.Width = 150
+            $btnStop.Location = New-Object System.Drawing.Point(160, 105)
+            $serialPopup.Controls.Add($btnStop)
+
+            $btnStop.Add_Click({
+                $confirm = [System.Windows.Forms.MessageBox]::Show(
+                    "Arrêter l'enrôlement maintenant ?`n`nL'utilisateur en cours ne sera pas enrôlé et les utilisateurs restants seront ignorés.",
+                    "Confirmer l'arrêt",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning)
+                if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    $script:StopRequested = $true
+                    $serialPopup.Close()
+                }
+            })
+
+            $script:KeyProcessed = $false
+
             $btnAddKey.Add_Click({
-                Write-Host "Processing $upn with Serial: $serialOutput"
+                Write-Host "Traitement de $upn (serie : $serialOutput)"
+                $script:KeyProcessed = $true
 
                 try {
-                    if ($randomPin) {
-                        Write-Host "Setting PIN using fido2-manage.exe..."
-                        & ".\fido2-manage.exe" -setPIN -pin $randomPin -device 1
+                    Write-Host "Definition du PIN via fido2-manage.exe..."
+                    # fido2-manage.exe appelle en interne .\libfido2-ui.exe (chemin
+                    # relatif au repertoire courant) : on se place dans $PSScriptRoot
+                    # le temps de l'appel pour qu'il retrouve son sous-outil.
+                    Push-Location $PSScriptRoot
+                    try {
+                        $setPinOutput = (& "$PSScriptRoot\fido2-manage.exe" -setPIN -pin $randomPin -device $script:DeviceNumber 2>&1) | Out-String
+                    } finally { Pop-Location }
+                    if ($LASTEXITCODE -ne 0 -or $setPinOutput -match 'FIDO_ERR|error|failed') {
+                        throw "Echec de la definition du PIN (code $LASTEXITCODE). La cle possede probablement deja un PIN (cle non vierge : reinitialisez-la avant reutilisation). Detail : $($setPinOutput.Trim())"
                     }
 
-###NOTE   ------------------------------         Passkey registration
+                    Write-Host "Enregistrement de la passkey pour $upn..."
+                    $graphResult = Get-PasskeyRegistrationOptions -UserId $upn |
+                        CTAP-Create-Custom-Passkey -DisplayName $serialOutput -pin $randomPin |
+                        Graph-Register-Custom-Passkey -UserId $upn
+                    $credentialId = if ($graphResult) { "$($graphResult.Id)" } else { '' }
 
-                    Write-Host "Registering passkey for $upn..."
-					<#
-					#I dont think we need this anymore due to Windows Hello being bypassed
-					# Set the initial size of the form
-					$serialPopup.Size = New-Object System.Drawing.Size(900, 100)
-
-					# Get the current position of the form
-					$currentLocation = $serialPopup.Location
-
-					# Move the form 300 pixels to the left
-					$serialPopup.Location = New-Object System.Drawing.Point(($currentLocation.X - 300), $currentLocation.Y)
-#>
-					
-					
-                    #Graph-Register-Custom-Passkey -UserId $upn -DisplayName $serialOutput
-					# apparently calling Graph register makes it not yet be aware of some types, dont ask me why, PLEASE!
-					Get-PasskeyRegistrationOptions -UserId $upn | CTAP-Create-Custom-Passkey -DisplayName $serialOutput -pin $randomPin | Graph-Register-Custom-Passkey -UserId $upn
-					
-					$serialPopup.Size = New-Object System.Drawing.Size(400, 200)
-					 
-                    Write-Host "Passkey registered successfully for $upn."
-					  
+                    Write-Host "Passkey enregistree pour $upn."
 
                     $forcedPin = $false
-                    if ($chkForcePinChange.Checked -and $randomPin) {
-                        Write-Host "Forcing PIN change using fido2-manage.exe..."
-                        & ".\fido2-manage.exe" -forcePINchange -pin $randomPin -device 1
+                    if ($chkForcePinChange.Checked) {
+                        Write-Host "Activation du changement de PIN obligatoire..."
+                        Push-Location $PSScriptRoot
+                        try {
+                            $forceOutput = (& "$PSScriptRoot\fido2-manage.exe" -forcePINchange -pin $randomPin -device $script:DeviceNumber 2>&1) | Out-String
+                        } finally { Pop-Location }
+                        if ($LASTEXITCODE -ne 0 -or $forceOutput -match 'FIDO_ERR|error|failed') {
+                            throw "Echec de l'activation du changement de PIN obligatoire (code $LASTEXITCODE). Detail : $($forceOutput.Trim())"
+                        }
                         $forcedPin = $true
                     }
 
-                    # Log the results
-                    $logEntry = "$upn,$serialOutput,$randomPin,$forcedPin"
-                    if (-not (Test-Path $logFilePath)) {
-                        "UPN,Serial Number,PIN,ForcePINChange" | Out-File -FilePath $logFilePath -Encoding UTF8
+                    # Envoi du PIN temporaire par mail au collaborateur
+                    $mailSent = $false
+                    try {
+                        Send-PinMail -ToUpn $upn -Pin $randomPin -Serial $serialOutput
+                        $mailSent = $true
+                        Write-Host "Mail envoye a $upn."
+                    } catch {
+                        $mailErr = $_.Exception.Message
+                        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $mailErr = "$mailErr | $($_.ErrorDetails.Message)" }
+                        Write-Host "Echec envoi mail a $upn : $mailErr"
                     }
-                    $logEntry | Out-File -FilePath $logFilePath -Append -Encoding UTF8
-                    Write-Host "Logged results for $upn."
-					  # Show MessageBox only if there's a next user
+
+                    # Journalisation du succes. PIN NON stocke (transmis par mail,
+                    # ephemere + Force PIN Change) : seul MailSent est trace.
+                    Write-EnrollmentLog -Upn $upn -Serial $serialOutput -Pin '' `
+                        -ForcedPinChange $forcedPin -Statut 'Succes' `
+                        -MailSent $mailSent -CredentialId $credentialId
+                    Write-Host "Resultat journalise pour $upn."
+
                     if ($currentIndex -lt $totalUsers) {
-                        [System.Windows.Forms.MessageBox]::Show("Prepare the next key and click OK to continue.", 
-                            "Next Key Prompt", 
-                            [System.Windows.Forms.MessageBoxButtons]::OK, 
-                            [System.Windows.Forms.MessageBoxIcon]::Information)
+                        Write-Host "Utilisateur suivant..."
                     } else {
-                        Write-Host "All users processed. No further prompts."
+                        Write-Host "Tous les utilisateurs ont ete traites."
                     }
-	
+
                 } catch {
-                    Write-Host "Error during provisioning "
-                    [System.Windows.Forms.MessageBox]::Show("An error occurred during provisioning ", "Error")
-					throw
+                    $errMsg = $_.Exception.Message
+                    # Le corps de la reponse Graph contient le detail reel de
+                    # l'erreur (code + raison), sinon masque par le message generique
+                    if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                        $errMsg = "$errMsg | Detail Graph : $($_.ErrorDetails.Message)"
+                    }
+                    Write-Host "Erreur pendant l'enrolement : $errMsg"
+                    Write-EnrollmentLog -Upn $upn -Serial $serialOutput -Pin '' `
+                        -Statut 'Echec' -Detail $errMsg
+                    [System.Windows.Forms.MessageBox]::Show("Une erreur est survenue pendant l'enrôlement :`n$errMsg", "Erreur")
                 } finally {
-                    # Close the popup
                     $serialPopup.Close()
                 }
             })
 
             $serialPopup.ShowDialog()
+
+            # Fenetre fermee sans clic sur "Initialiser la clé" -> utilisateur ignore.
+            # On distingue un arret volontaire d'un simple abandon d'utilisateur.
+            if (-not $script:KeyProcessed) {
+                if ($script:StopRequested) {
+                    Write-Host "Arret : $upn non enrole (campagne stoppee)."
+                    Write-EnrollmentLog -Upn $upn -Serial $serialOutput -Statut 'Ignore' -Detail "Non enrole - campagne arretee par l'operateur"
+                } else {
+                    Write-Host "Fenetre fermee : $upn ignore par l'operateur."
+                    Write-EnrollmentLog -Upn $upn -Serial $serialOutput -Statut 'Ignore' -Detail "Ignore par l'operateur"
+                }
+            }
         }
 
-        [System.Windows.Forms.MessageBox]::Show("Provisioning complete.", "Success")
-		 $form.Visible = $true
+        if ($script:StopRequested) {
+            [System.Windows.Forms.MessageBox]::Show("Enrôlement arrêté par l'opérateur. Les utilisateurs restants n'ont pas été traités.", "Arrêté")
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Enrôlement terminé.", "Succes")
+        }
+        $form.Visible = $true
     } catch {
-        Write-Host "An error occurred: $($_)"
-        [System.Windows.Forms.MessageBox]::Show("An error occurred: $($_)", "Error")
+        Write-Host "Une erreur est survenue : $($_)"
+        [System.Windows.Forms.MessageBox]::Show("Une erreur est survenue : $($_)", "Erreur")
+        $form.Visible = $true
     }
 })
 
- 
-
 $form.ShowDialog()
-
 
 $form.add_Activated({
     [User32]::SetForegroundWindow([System.Diagnostics.Process]::GetCurrentProcess().MainWindowHandle)
