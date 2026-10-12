@@ -460,7 +460,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # =====================================================================
 #  Configuration generale
 # =====================================================================
-$script:ScriptVersion = '2.6.0-IFPEN'
+$script:ScriptVersion = '2.7.0-IFPEN'
 
 # Repertoire des logs : par defaut sous le dossier du script.
 # Cible production : zone reseau dediee avec ACL append-only, ex.
@@ -538,6 +538,155 @@ function Get-ExistingPasskeyCount {
 }
 
 # =====================================================================
+#  Connexion Graph (reutilisable : recherche de groupe ET demarrage)
+# =====================================================================
+$script:GraphScopes = @(
+    'UserAuthenticationMethod.ReadWrite.All',
+    'Mail.Send',
+    'GroupMember.Read.All',   # recherche de groupes + lecture des membres
+    'User.Read.All'           # lecture de accountEnabled
+)
+
+# Se connecte a Graph uniquement si aucun contexte n'existe ou si des scopes manquent.
+function Connect-GraphIfNeeded {
+    param([Parameter(Mandatory)][string] $TenantId)
+    $ctx = Get-MgContext -ErrorAction SilentlyContinue
+    $missing = if ($ctx) { @($script:GraphScopes | Where-Object { $ctx.Scopes -notcontains $_ }) } else { $script:GraphScopes }
+    if (-not $ctx -or $missing.Count -gt 0) {
+        Write-Host "Connexion a Microsoft Graph"
+        Connect-MgGraph -Scopes $script:GraphScopes -TenantId $TenantId -NoWelcome
+    }
+}
+
+# Recherche de groupes Entra par nom (recherche "contient un mot" via $search)
+function Search-EntraGroup {
+    param([Parameter(Mandatory)][string] $Text)
+    $safe = $Text.Replace('"', '')
+    $search = [uri]::EscapeDataString("`"displayName:$safe`"")
+    $uri = "https://graph.microsoft.com/v1.0/groups?`$search=$search" +
+           "&`$select=id,displayName,description,mail,groupTypes,securityEnabled" +
+           "&`$orderby=displayName&`$top=100&`$count=true"
+    $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' }
+    return @($resp.value)
+}
+
+# UPN des utilisateurs ACTIFS du groupe (membres transitifs, pagination geree)
+function Get-EntraGroupActiveUserUpns {
+    param([Parameter(Mandatory)][string] $GroupId)
+    $upns = New-Object System.Collections.Generic.List[string]
+    $uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/transitiveMembers/microsoft.graph.user" +
+           "?`$select=userPrincipalName,accountEnabled&`$top=999"
+    while ($uri) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+        foreach ($u in $resp.value) {
+            if ($u.accountEnabled -eq $true -and $u.userPrincipalName) {
+                $upns.Add([string]$u.userPrincipalName)
+            }
+        }
+        $uri = $resp.'@odata.nextLink'
+    }
+    return @($upns | Sort-Object -Unique)
+}
+
+# Fenetre de recherche/selection de groupe. Retourne @{Id;DisplayName} ou $null.
+function Show-GroupPicker {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Rechercher un groupe Entra ID"
+    $dlg.Size = New-Object System.Drawing.Size(620, 440)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Location = New-Object System.Drawing.Point(15, 15)
+    $txt.Width = 460
+    $dlg.Controls.Add($txt)
+
+    $btnSearch = New-Object System.Windows.Forms.Button
+    $btnSearch.Text = "Rechercher"
+    $btnSearch.Width = 100
+    $btnSearch.Location = New-Object System.Drawing.Point(490, 13)
+    $dlg.Controls.Add($btnSearch)
+    $dlg.AcceptButton = $btnSearch   # Entree = rechercher
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = New-Object System.Drawing.Point(15, 50)
+    $lv.Size = New-Object System.Drawing.Size(575, 290)
+    $lv.View = [System.Windows.Forms.View]::Details
+    $lv.FullRowSelect = $true
+    $lv.MultiSelect = $false
+    $lv.HideSelection = $false
+    [void]$lv.Columns.Add("Nom", 220)
+    [void]$lv.Columns.Add("Type", 90)
+    [void]$lv.Columns.Add("Description", 260)
+    $dlg.Controls.Add($lv)
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.Location = New-Object System.Drawing.Point(15, 350)
+    $lblStatus.Size = New-Object System.Drawing.Size(360, 40)
+    $lblStatus.Text = "Saisissez au moins 2 caractères puis Rechercher."
+    $dlg.Controls.Add($lblStatus)
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = "Sélectionner"
+    $btnOk.Width = 100
+    $btnOk.Enabled = $false
+    $btnOk.Location = New-Object System.Drawing.Point(380, 360)
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Annuler"
+    $btnCancel.Width = 100
+    $btnCancel.Location = New-Object System.Drawing.Point(490, 360)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+    $dlg.CancelButton = $btnCancel
+
+    $btnSearch.Add_Click({
+        $q = $txt.Text.Trim()
+        if ($q.Length -lt 2) { $lblStatus.Text = "Saisissez au moins 2 caractères."; return }
+        $lblStatus.Text = "Recherche en cours..."
+        $dlg.Refresh()
+        $lv.Items.Clear()
+        $btnOk.Enabled = $false
+        try {
+            $groups = @(Search-EntraGroup -Text $q)
+            foreach ($g in $groups) {
+                $type = if ($g.groupTypes -contains 'Unified') { 'Microsoft 365' }
+                        elseif ($g.securityEnabled) { 'Sécurité' }
+                        else { 'Distribution' }
+                $item = New-Object System.Windows.Forms.ListViewItem([string]$g.displayName)
+                [void]$item.SubItems.Add($type)
+                [void]$item.SubItems.Add([string]$g.description)
+                $item.Tag = @{ Id = [string]$g.id; DisplayName = [string]$g.displayName }
+                [void]$lv.Items.Add($item)
+            }
+            $lblStatus.Text = "$($groups.Count) groupe(s) trouvé(s)."
+        } catch {
+            $lblStatus.Text = "Erreur : $($_.Exception.Message)"
+        }
+    })
+
+    $lv.Add_SelectedIndexChanged({ $btnOk.Enabled = ($lv.SelectedItems.Count -eq 1) })
+    $lv.Add_DoubleClick({
+        if ($lv.SelectedItems.Count -eq 1) {
+            $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $dlg.Close()
+        }
+    })
+
+    $result = $dlg.ShowDialog()
+    $selected = $null
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $lv.SelectedItems.Count -eq 1) {
+        $selected = $lv.SelectedItems[0].Tag
+    }
+    $dlg.Dispose()
+    return $selected
+}
+
+# =====================================================================
 #  Tenant ID en registre
 # =====================================================================
 $regPath = "HKCU:\Software\Token2BulkFido"
@@ -597,7 +746,7 @@ Sécurité IFPEN
 # =====================================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Enrôlement des clés FIDO2"
-$form.Size = New-Object System.Drawing.Size(520, 400)
+$form.Size = New-Object System.Drawing.Size(520, 470)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
 $form.MaximizeBox = $false
@@ -623,20 +772,59 @@ try {
     Write-Host "Impossible de lire l'ID du tenant depuis le registre : $_"
 }
 
+# --- Source des utilisateurs : fichier CSV ou groupe Entra ID ---
+$rbCsv = New-Object System.Windows.Forms.RadioButton
+$rbCsv.Text = "Fichier CSV"
+$rbCsv.AutoSize = $true
+$rbCsv.Checked = $true
+$rbCsv.Location = New-Object System.Drawing.Point(20, 55)
+$form.Controls.Add($rbCsv)
+
+$rbGroup = New-Object System.Windows.Forms.RadioButton
+$rbGroup.Text = "Groupe Entra ID (utilisateurs actifs)"
+$rbGroup.AutoSize = $true
+$rbGroup.Location = New-Object System.Drawing.Point(160, 55)
+$form.Controls.Add($rbGroup)
+
 # --- Fichier CSV des utilisateurs ---
 $btnSelectFile = New-Object System.Windows.Forms.Button
 $btnSelectFile.Text = "Fichier CSV..."
 $btnSelectFile.Width = 120
-$btnSelectFile.Location = New-Object System.Drawing.Point(20, 60)
+$btnSelectFile.Location = New-Object System.Drawing.Point(20, 85)
 $form.Controls.Add($btnSelectFile)
 
 $labelFilePath = New-Object System.Windows.Forms.Label
 $labelFilePath.AutoSize = $true
 $labelFilePath.MaximumSize = New-Object System.Drawing.Size(320, 0)
-$labelFilePath.Location = New-Object System.Drawing.Point(160, 65)
+$labelFilePath.Location = New-Object System.Drawing.Point(160, 90)
 $labelFilePath.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $labelFilePath.Text = "(aucun fichier sélectionné)"
 $form.Controls.Add($labelFilePath)
+
+# --- Groupe Entra ID ---
+$btnSelectGroup = New-Object System.Windows.Forms.Button
+$btnSelectGroup.Text = "Choisir un groupe..."
+$btnSelectGroup.Width = 120
+$btnSelectGroup.Enabled = $false
+$btnSelectGroup.Location = New-Object System.Drawing.Point(20, 120)
+$form.Controls.Add($btnSelectGroup)
+
+$labelGroup = New-Object System.Windows.Forms.Label
+$labelGroup.AutoSize = $true
+$labelGroup.MaximumSize = New-Object System.Drawing.Size(320, 0)
+$labelGroup.Location = New-Object System.Drawing.Point(160, 125)
+$labelGroup.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+$labelGroup.Text = "(aucun groupe sélectionné)"
+$form.Controls.Add($labelGroup)
+
+$script:SelectedGroup = $null
+
+$updateSource = {
+    $btnSelectFile.Enabled  = $rbCsv.Checked
+    $btnSelectGroup.Enabled = $rbGroup.Checked
+}
+$rbCsv.Add_CheckedChanged($updateSource)
+$rbGroup.Add_CheckedChanged($updateSource)
 
 $btnSelectFile.Add_Click({
     $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -647,11 +835,28 @@ $btnSelectFile.Add_Click({
     }
 })
 
+$btnSelectGroup.Add_Click({
+    if (-not $textTenantId.Text) {
+        [System.Windows.Forms.MessageBox]::Show("Veuillez saisir l'ID du tenant.", "Erreur")
+        return
+    }
+    try {
+        Connect-GraphIfNeeded -TenantId $textTenantId.Text
+        $g = Show-GroupPicker
+        if ($g) {
+            $script:SelectedGroup = $g
+            $labelGroup.Text = "$($g.DisplayName)`n($($g.Id))"
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Connexion/recherche impossible :`n$($_.Exception.Message)", "Erreur")
+    }
+})
+
 # --- Options de securite : IMPOSEES (cochees et verrouillees) ---
 $chkSetRandomPin = New-Object System.Windows.Forms.CheckBox
 $chkSetRandomPin.Text = "PIN aléatoire (obligatoire)"
 $chkSetRandomPin.AutoSize = $true
-$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 105)
+$chkSetRandomPin.Location = New-Object System.Drawing.Point(20, 165)
 $chkSetRandomPin.Checked = $true
 $chkSetRandomPin.Enabled = $false
 $form.Controls.Add($chkSetRandomPin)
@@ -719,17 +924,42 @@ $btnProceed.Add_Click({
             return
         }
 
-        if (-not $filePath -or -not (Test-Path $filePath)) {
+        if ($rbCsv.Checked -and (-not $filePath -or -not (Test-Path $filePath))) {
             [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un fichier CSV valide.", "Erreur")
             $form.Visible = $true
             return
         }
 
-        Set-ItemProperty -Path $regPath -Name "TenantId" -Value $tenantId -Force
-        Write-Host "Connexion a Microsoft Graph"
-        Connect-MgGraph -Scopes 'UserAuthenticationMethod.ReadWrite.All','Mail.Send' -TenantId $tenantId -NoWelcome
+        if ($rbGroup.Checked -and -not $script:SelectedGroup) {
+            [System.Windows.Forms.MessageBox]::Show("Veuillez sélectionner un groupe Entra ID.", "Erreur")
+            $form.Visible = $true
+            return
+        }
 
-        $upns = Import-Csv $filePath | Select-Object -ExpandProperty UPN
+        Set-ItemProperty -Path $regPath -Name "TenantId" -Value $tenantId -Force
+        Connect-GraphIfNeeded -TenantId $tenantId
+
+        if ($rbGroup.Checked) {
+            Write-Host "Lecture des membres actifs du groupe $($script:SelectedGroup.DisplayName)..."
+            $upns = @(Get-EntraGroupActiveUserUpns -GroupId $script:SelectedGroup.Id)
+            if ($upns.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show("Aucun utilisateur actif dans ce groupe.", "Information")
+                $form.Visible = $true
+                return
+            }
+            $confirm = [System.Windows.Forms.MessageBox]::Show(
+                "$($upns.Count) utilisateur(s) actif(s) dans le groupe '$($script:SelectedGroup.DisplayName)'.`n`nDémarrer l'enrôlement ?",
+                "Confirmation",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
+                $form.Visible = $true
+                return
+            }
+        } else {
+            $upns = @(Import-Csv $filePath | Select-Object -ExpandProperty UPN)
+        }
+
         $totalUsers = $upns.Count
         $currentIndex = 0
         $script:StopRequested = $false   # arret volontaire par l'operateur
